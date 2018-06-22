@@ -20,13 +20,7 @@ pub trait Transport {
     fn receive_packet(&mut self) -> Result<String, io::Error>;
 }
 
-/// A Transport implementation that uses Language Server Protocol to transport packets between
-/// client and server.
-pub struct LspTransport<R: BufRead> {
-    input: R,
-}
-
-fn read_lsp_packet<R: BufRead>(input:&mut R) -> Result<String, io::Error> {
+pub fn read_lsp_packet<R: BufRead>(input:&mut R) -> Result<String, io::Error> {
         let mut packet_size: Option<usize> = None;
         // Read headers
         loop {
@@ -83,6 +77,29 @@ fn read_lsp_packet<R: BufRead>(input:&mut R) -> Result<String, io::Error> {
                 ),
             )
         })
+}
+
+pub struct LspStdTransport {
+}
+
+impl Transport for LspStdTransport {
+    fn receive_packet(&mut self) -> Result<String, io::Error> {
+        let stdin = io::stdin();
+        let mut locked = stdin.lock();
+        read_lsp_packet(&mut locked)
+    }
+}
+
+/// A Transport implementation that uses Language Server Protocol to transport packets between
+/// client and server.
+pub struct LspTransport<R: BufRead> {
+    input: R,
+}
+
+impl<R: BufRead> LspTransport<R> {
+    pub fn new(input: R) -> Self {
+        return LspTransport{input: input}
+    }
 }
 
 impl<R: BufRead> Transport for LspTransport<R> {
