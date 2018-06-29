@@ -8,14 +8,13 @@ use std::marker::Sized;
 
 use jsonrpc_core::{self as jsonrpc, Id};
 
-use server::transport::{LspTransport, Transport};
-
 pub struct JsonRpcServer<T: Transport> {
     transport: T,
 }
 
 impl<T: Transport> JsonRpcServer<T> {
     fn parse_message<'a>(
+        &'a self,
         packet: &str,
     ) -> Result<Message<JsonResponseHandle<'a, T>>, jsonrpc::Failure> {
         let msg: serde_json::Value = serde_json::from_str(&packet).unwrap();
@@ -41,20 +40,31 @@ impl<T: Transport> JsonRpcServer<T> {
             // Null as input value is not allowed by JSON-RPC 2.0,
             // but including it for robustness
             Some(serde_json::Value::Null) | None => serde_json::Value::Null,
+            // TODO: do not panic
             _ => panic!("test"),
         };
 
-        return Ok(Message::Notification(RawNotification {
-            method: method,
-            params: params,
-        }));
+        match id {
+            Id::Null => Ok(Message::Notification(RawNotification {
+                method: method,
+                params: params,
+            })),
+            _ => Ok(Message::Request(RawRequest {
+                method: method,
+                params: params,
+                response: JsonResponseHandle {
+                    id: 123,
+                    server: self,
+                },
+            })),
+        }
     }
 
-    pub fn read_message<'a>(&'a mut self) -> Result<Message<JsonResponseHandle<'a, T>>, io::Error> {
+    pub fn read_message<'a>(&'a self) -> Result<Message<JsonResponseHandle<'a, T>>, io::Error> {
         loop {
             let packet = self.transport.receive_packet()?;
 
-            match Self::parse_message(&packet) {
+            match self.parse_message(&packet) {
                 Ok(message) => return Ok(message),
                 Err(failure) => {
                     // TODO: send this failure back to client.
@@ -71,8 +81,19 @@ pub struct JsonResponseHandle<'a, T: Transport + 'a> {
 }
 
 impl<'a, T: Transport> ResponseHandle for JsonResponseHandle<'a, T> {
-    fn success<R: ::serde::Serialize + fmt::Debug>(self, result: R) {}
-    fn failure(self, error: jsonrpc::Error) {}
+    fn success(self, result: serde_json::Value) {
+        // TODO: unwrap
+        self.server
+            .transport
+            .send_packet(json!({ "result": result }).to_string())
+            .unwrap();
+    }
+    fn failure(self, error: jsonrpc::Error) {
+        self.server
+            .transport
+            .send_packet(json!({ "error": error }).to_string())
+            .unwrap();
+    }
 }
 
 // Explanations:
@@ -82,8 +103,8 @@ pub trait ResponseHandle
 where
     Self: Sized,
 {
-    fn success<R: ::serde::Serialize + fmt::Debug>(self, result: R) {}
-    fn failure(self, error: jsonrpc::Error) {}
+    fn success(self, result: serde_json::Value);
+    fn failure(self, error: jsonrpc::Error);
 }
 
 /*
@@ -138,41 +159,102 @@ pub enum Message<R: ResponseHandle> {
     Notification(RawNotification),
 }
 
+/// A transport mechanism used for communication between client and server.
+pub trait Transport {
+    /// Reads a next packet from a client.
+    fn receive_packet(&self) -> Result<String, io::Error>;
+    fn send_packet(&self, packet: String) -> Result<(), io::Error>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::{channel, Receiver, Sender};
 
     struct FakeTransport {
-        message: String,
+        receiver: Receiver<String>,
+        sender: Sender<String>,
     }
     impl Transport for FakeTransport {
-        fn receive_packet(&mut self) -> Result<String, io::Error> {
-            return Ok(self.message.to_owned());
+        fn receive_packet(&self) -> Result<String, io::Error> {
+            return Ok(self.receiver.recv().unwrap());
+        }
+        fn send_packet(&self, packet: String) -> Result<(), io::Error> {
+            return Ok(self.sender.send(packet).unwrap());
         }
     }
 
     #[test]
-    fn reads_notification() {
+    fn read_message_returns_notification_when_message_is_missing_id() {
+        // TODO refactor
+        let (sender1, receiver1) = channel::<String>();
+        let (sender2, receiver2) = channel::<String>();
         let mut server = JsonRpcServer {
             transport: FakeTransport {
-                message: json!({
+                receiver: receiver1,
+                sender: sender2,
+            },
+        };
+        sender1
+            .send(
+                json!({
                     "method": "hover",
                     "params": {
                         "key": "value"
                     }
                 }).to_string(),
-            },
-        };
+            )
+            .unwrap();
+
         let message = server
             .read_message()
             .expect("Notification should be returned from valid notification packet");
 
         let raw_notification = match message {
             Message::Notification(n) => n,
-            _ => panic!("Expected notification, got "),
+            _ => panic!("Expected notification"),
         };
-
         assert_eq!(raw_notification.method, "hover");
         assert_eq!(raw_notification.params, json!({"key": "value"}));
+    }
+
+    #[test]
+    fn read_message_returns_request_when_message_has_id() {
+        // TODO refactor
+        let (sender1, receiver1) = channel::<String>();
+        let (sender2, receiver2) = channel::<String>();
+        let mut server = JsonRpcServer {
+            transport: FakeTransport {
+                receiver: receiver1,
+                sender: sender2,
+            },
+        };
+        sender1
+            .send(
+                json!({
+                    "id": 123,
+                    "method": "hover",
+                    "params": {
+                        "key": "value"
+                    }
+                }).to_string(),
+            )
+            .unwrap();
+
+        let message = server
+            .read_message()
+            .expect("Notification should be returned from valid notification packet");
+
+        let raw_request = match message {
+            Message::Request(r) => r,
+            _ => panic!("Expected request"),
+        };
+        assert_eq!(raw_request.method, "hover");
+        assert_eq!(raw_request.params, json!({"key": "value"}));
+        raw_request.response.success(json!({"success": "yes"}));
+
+        let response = receiver2.recv().unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response, json!({"result": {"success": "yes"}}));
     }
 }
