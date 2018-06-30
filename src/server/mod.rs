@@ -44,7 +44,6 @@ use vfs::Vfs;
 mod dispatch;
 mod io;
 mod message;
-mod transport;
 mod rpc;
 
 const NOT_INITIALIZED_CODE: ErrorCode = ErrorCode::ServerError(-32002);
